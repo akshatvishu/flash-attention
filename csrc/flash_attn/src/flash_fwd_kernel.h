@@ -504,7 +504,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, bool OneTile = false, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
 
     using Element = typename Kernel_traits::Element;
@@ -534,7 +534,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
-    const int n_blocks_per_split = ((params.seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
+    const int n_blocks_per_split = OneTile ? 1 : ((params.seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
     const int n_block_min = !Is_local
         ? n_split_idx * n_blocks_per_split
         : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
@@ -582,10 +582,20 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         #pragma unroll
         for (int m = 0; m < size<1>(tOgOaccum); ++m) {
             const int row = get<0>(tOcO(0, m, 0));
-            if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSEaccum(row) = Split ? -INFINITY : INFINITY; }
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) {
+                if constexpr (Split) {
+                    reinterpret_cast<float2*>(params.softmax_lseaccum_ptr)[row_offset_lseaccum + row] =
+                        make_float2(-INFINITY, 0.f);
+                } else {
+                    gLSEaccum(row) = INFINITY;
+                }
+            }
         }
         return;
     }
+
+    // Each nonempty split has exactly one key tile in this specialization.
+    if constexpr (OneTile) { n_block_max = n_block_min + 1; }
 
     // We iterate over the blocks in reverse order. This is because the last block is the only one
     // that needs masking when we read K and V from global memory. Moreover, iterating in reverse
@@ -1063,7 +1073,17 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         #pragma unroll
         for (int mi = 0; mi < size(lse); ++mi) {
             const int row = get<0>(taccOcO_row(mi));
-            if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSEaccum(row) = lse(mi); }
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM) {
+                if constexpr (Split) {
+                    const float sum = softmax.row_sum(mi);
+                    // Order the split anchors in the same direction as the scaled logits.
+                    const float anchor = params.scale_softmax < 0.f ? -softmax.row_max(mi) : softmax.row_max(mi);
+                    reinterpret_cast<float2*>(params.softmax_lseaccum_ptr)[row_offset_lseaccum + row] =
+                        sum > 0.f ? make_float2(anchor, sum) : make_float2(-INFINITY, 0.f);
+                } else {
+                    gLSEaccum(row) = lse(mi);
+                }
+            }
         }
     }
 
@@ -1105,7 +1125,7 @@ inline __device__ void compute_attn(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, bool OneTile = false, typename Params>
 inline __device__ void compute_attn_splitkv(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1114,12 +1134,12 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
-    FLASH_NAMESPACE::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    FLASH_NAMESPACE::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV, OneTile>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, typename Params>
+template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, bool Group_loads, typename Params>
 inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -1135,6 +1155,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     // Shared memory.
     // kBlockM + 1 instead of kBlockM to reduce bank conflicts.
     __shared__ ElementAccum sLSE[kMaxSplits][kBlockM + 1];
+    __shared__ ElementAccum split_sums[kMaxSplits][kBlockM + 1];
 
     // The thread and block index.
     const int tidx = threadIdx.x;
@@ -1143,7 +1164,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     const index_t lse_size = static_cast<index_t>(params.b) * params.h * params.seqlen_q;
 
     const index_t row_offset_lse = bidx * kBlockM;
-    Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lseaccum_ptr) + row_offset_lse),
+    Tensor gSplitStats = make_tensor(make_gmem_ptr(reinterpret_cast<const float2 *>(params.softmax_lseaccum_ptr) + row_offset_lse),
                                    Shape<Int<kMaxSplits>, Int<kBlockM>>{},
                                    make_stride(lse_size, _1{}));
 
@@ -1163,18 +1184,30 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
 
     constexpr int kNLsePerThread = (kMaxSplits * kBlockM + kNThreads - 1) / kNThreads;
 
-    // Read the LSE values from gmem and store them in shared memory, then transpose them.
+    // Small tiles load each split directly into its reduction lane.
     constexpr int kRowsPerLoadLSE = kNThreads / kBlockM;
+    constexpr bool warp_pair = kMaxSplits == 2 && kBlockM == 8;
+    constexpr bool in_registers = kMaxSplits * kBlockM <= kNThreads && kMaxSplits <= 32;
+    constexpr bool transposed_load = in_registers && !warp_pair;
+    float2 lane_pair = make_float2(-INFINITY, 0.f);
     #pragma unroll
     for (int l = 0; l < kNLsePerThread; ++l) {
-        const int row = l * kRowsPerLoadLSE + tidx / kBlockM;
-        const int col = tidx % kBlockM;
-        ElementAccum lse = (row < params.num_splits && col < lse_size - bidx * kBlockM) ? gLSEaccum(row, col) : -INFINITY;
-        if (row < kMaxSplits) { sLSE[row][col] = lse; }
-        // if (bidx == 0 && tidx < 32) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse); }
+        const int row = transposed_load ? tidx % kMaxSplits : l * kRowsPerLoadLSE + tidx / kBlockM;
+        const int col = transposed_load ? tidx / kMaxSplits : tidx % kBlockM;
+        if (row < kMaxSplits && col < kBlockM) {
+            float2 state = make_float2(-INFINITY, 0.f);
+            if (row < params.num_splits && row_offset_lse + col < lse_size) {
+                state = gSplitStats(row, col);
+            }
+            if constexpr (in_registers) {
+                lane_pair = state;
+            } else {
+                sLSE[row][col] = state.x;
+                split_sums[row][col] = state.y;
+            }
+        }
     }
-    // if (bidx == 1 && tidx < 32) { printf("tidx = %d, row_offset_lse = %d, lse = %f\n", tidx, row_offset_lse, lse_accum(0)); }
-    __syncthreads();
+    if constexpr (!in_registers) { __syncthreads(); }
     Tensor lse_accum = make_tensor<ElementAccum>(Shape<Int<kNLsePerThread>>{});
     constexpr int kRowsPerLoadTranspose = std::min(kRowsPerLoadLSE, kMaxSplits);
     // To make sure that kMaxSplits is within 1 warp: we decide how many elements within kMaxSplits
@@ -1188,42 +1221,78 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     for (int l = 0; l < kNLsePerThread; ++l) {
         const int row = l * kRowsPerLoadTranspose + tidx % kRowsPerLoadTranspose;
         const int col = tidx / kRowsPerLoadTranspose;
-        lse_accum(l) = (row < kMaxSplits && col < kBlockM) ? sLSE[row][col] : -INFINITY;
-        // if (bidx == 0 && tidx < 32) { printf("tidx = %d, row = %d, col = %d, lse = %f\n", tidx, row, col, lse_accum(l)); }
+        lse_accum(l) = in_registers ? lane_pair.x : (row < kMaxSplits && col < kBlockM ? sLSE[row][col] : -INFINITY);
     }
 
-    // Compute the logsumexp of the LSE along the split dimension.
+    auto reduce_splits = [&](float value, auto op) {
+        if constexpr (warp_pair) {
+            return op(value, __shfl_xor_sync(0xffffffff, value, kBlockM));
+        } else {
+            return Allreduce<kRowsPerLoadTranspose>::run(value, op);
+        }
+    };
     ElementAccum lse_max = lse_accum(0);
     #pragma unroll
     for (int l = 1; l < kNLsePerThread; ++l) { lse_max = max(lse_max, lse_accum(l)); }
     MaxOp<float> max_op;
-    lse_max = Allreduce<kRowsPerLoadTranspose>::run(lse_max, max_op);
+    lse_max = reduce_splits(lse_max, max_op);
     lse_max = lse_max == -INFINITY ? 0.0f : lse_max;  // In case all local LSEs are -inf
-    float lse_sum = expf(lse_accum(0) - lse_max);
-    #pragma unroll
-    for (int l = 1; l < kNLsePerThread; ++l) { lse_sum += expf(lse_accum(l) - lse_max); }
-    SumOp<float> sum_op;
-    lse_sum = Allreduce<kRowsPerLoadTranspose>::run(lse_sum, sum_op);
-    // For the case where all local lse == -INFINITY, we want to set lse_logsum to INFINITY. Otherwise
-    // lse_logsum is log(0.0) = -INFINITY and we get NaN when we do lse_accum(l) - lse_logsum.
-    ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : logf(lse_sum) + lse_max;
-    // if (bidx == 0 && tidx < 32) { printf("tidx = %d, lse = %f, lse_max = %f, lse_logsum = %f\n", tidx, lse_accum(0), lse_max, lse_logsum); }
-    if (tidx % kRowsPerLoadTranspose == 0 && tidx / kRowsPerLoadTranspose < kBlockM) {
-        if (params.unpadded_lse) {
-            const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
-            if (lse_offset < lse_size) {
-                gLSE_unpadded(lse_offset) = lse_logsum;
-            }
-        } else {
-            gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
-        }
-    }
-    // Store the scales exp(lse - lse_logsum) in shared memory.
+    const float magnitude = fabsf(params.scale_softmax);
+    float lse_sum = 0.f;
     #pragma unroll
     for (int l = 0; l < kNLsePerThread; ++l) {
         const int row = l * kRowsPerLoadTranspose + tidx % kRowsPerLoadTranspose;
         const int col = tidx / kRowsPerLoadTranspose;
-        if (row < params.num_splits && col < kBlockM) { sLSE[row][col] = expf(lse_accum(l) - lse_logsum); }
+        const float sum = in_registers ? lane_pair.y : (row < kMaxSplits && col < kBlockM ? split_sums[row][col] : 0.f);
+        const float delta = lse_accum(l) - lse_max;
+        float shifted = delta * magnitude;
+        // Opposite finite extrema can overflow the subtraction even at a tiny scale.
+        if (delta == -INFINITY && sum > 0.f && isfinite(lse_accum(l)) && isfinite(lse_max)) {
+            shifted = float((double(lse_accum(l)) - double(lse_max)) * double(magnitude));
+        }
+        const float log_mass = sum > 0.f ? shifted + logf(sum) : -INFINITY;
+        if (params.scale_softmax < 0.f) {
+            lse_accum(l) = log_mass;
+        } else {
+            lse_accum(l) = expf(log_mass);
+            lse_sum += lse_accum(l);
+        }
+    }
+    // When scale is negative, a sum relative to the producer's raw maximum can
+    // exceed the number of keys. Center these log masses before exponentiating.
+    float mass_offset = 0.f;
+    if (params.scale_softmax < 0.f) {
+        mass_offset = lse_accum(0);
+        #pragma unroll
+        for (int l = 1; l < kNLsePerThread; ++l) { mass_offset = max(mass_offset, lse_accum(l)); }
+        mass_offset = reduce_splits(mass_offset, max_op);
+        mass_offset = mass_offset == -INFINITY ? 0.f : mass_offset;
+        #pragma unroll
+        for (int l = 0; l < kNLsePerThread; ++l) {
+            lse_accum(l) = expf(lse_accum(l) - mass_offset);
+            lse_sum += lse_accum(l);
+        }
+    }
+    SumOp<float> sum_op;
+    lse_sum = reduce_splits(lse_sum, sum_op);
+    const bool valid_sum = lse_sum > 0.f;
+    const int query_row = warp_pair ? tidx % kBlockM : tidx / kRowsPerLoadTranspose;
+    const index_t lse_offset = row_offset_lse + query_row;
+    const bool write_lse = warp_pair ? tidx < kBlockM : (tidx % kRowsPerLoadTranspose == 0 && query_row < kBlockM);
+    if (write_lse && lse_offset < lse_size) {
+        const float lse = valid_sum ? (logf(lse_sum) + mass_offset) + lse_max * magnitude : INFINITY;
+        if (params.unpadded_lse) {
+            gLSE_unpadded(lse_offset) = lse;
+        } else {
+            gLSE(query_row) = lse;
+        }
+    }
+    // Normalize using the centered sum; the public FP32 LSE can lose the split mass.
+    const float inv_sum = valid_sum ? 1.f / lse_sum : 0.f;
+    #pragma unroll
+    for (int l = 0; l < kNLsePerThread; ++l) {
+        const int row = warp_pair ? tidx / kBlockM : l * kRowsPerLoadTranspose + tidx % kRowsPerLoadTranspose;
+        if (row < params.num_splits && query_row < kBlockM) { sLSE[row][query_row] = lse_accum(l) * inv_sum; }
     }
     __syncthreads();
 
@@ -1253,27 +1322,47 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
         #pragma unroll
         for (int k = 0; k < size(tOpOaccum); ++k) { tOpOaccum(k) = get<1>(tOcOaccum(0, 0, k)) < params.d; }
     }
-    // Load Oaccum in then scale and accumulate to O
-    for (int split = 0; split < params.num_splits; ++split) {
+    auto load_partial = [&](auto &partial) {
         FLASH_NAMESPACE::copy</*Is_even_MN=*/false, Is_even_K>(
-            gmem_tiled_copy_Oaccum, tOgOaccum, tOrOaccum, tOcOaccum, tOpOaccum, params.b * params.h * params.seqlen_q - bidx * kBlockM
-        );
+            gmem_tiled_copy_Oaccum, tOgOaccum, partial, tOcOaccum, tOpOaccum, lse_size - row_offset_lse);
+        tOgOaccum.data() = tOgOaccum.data() + lse_size * params.d_rounded;
+    };
+    auto accumulate_partial = [&](int split, auto const &partial) {
         #pragma unroll
-        for (int m = 0; m < size<1>(tOrOaccum); ++m) {
-            int row = get<0>(tOcOaccum(0, m, 0));
-            ElementAccum lse_scale = sLSE[split][row];
+        for (int m = 0; m < size<1>(partial); ++m) {
+            const int row = get<0>(tOcOaccum(0, m, 0));
+            const ElementAccum weight = sLSE[split][row];
             #pragma unroll
-            for (int k = 0; k < size<2>(tOrOaccum); ++k) {
+            for (int k = 0; k < size<2>(partial); ++k) {
                 #pragma unroll
-                for (int i = 0; i < size<0>(tOrOaccum); ++i) {
-                    tOrO(i, m, k) += lse_scale * tOrOaccum(i, m, k);
+                for (int i = 0; i < size<0>(partial); ++i) {
+                    tOrO(i, m, k) += weight * partial(i, m, k);
                 }
             }
-        // if (cute::thread0()) { printf("lse_scale = %f, %f\n", sLSE[split][0], sLSE[split][1]); print(tOrOaccum); }
         }
-        tOgOaccum.data() = tOgOaccum.data() + lse_size * params.d_rounded;
+    };
+
+    if constexpr (Group_loads) {
+        static_assert(kMaxSplits == 4);
+        // Issue the independent split loads together, then accumulate in split order.
+        decltype(tOrOaccum) partials[4];
+        #pragma unroll
+        for (int split = 0; split < 4; ++split) {
+            if (split < params.num_splits) {
+                clear(partials[split]);
+                load_partial(partials[split]);
+            }
+        }
+        #pragma unroll
+        for (int split = 0; split < 4; ++split) {
+            if (split < params.num_splits) { accumulate_partial(split, partials[split]); }
+        }
+    } else {
+        for (int split = 0; split < params.num_splits; ++split) {
+            load_partial(tOrOaccum);
+            accumulate_partial(split, tOrOaccum);
+        }
     }
-    // if (cute::thread0()) { print_tensor(tOrO); }
 
     Tensor rO = FLASH_NAMESPACE::convert_type<Element>(tOrO);
     // Write to gO

@@ -2967,6 +2967,43 @@ def test_flash_attn_kvcache_splitkv_large_accum(seqlen_q, num_splits, free_gib):
     torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("num_splits,cache_length", [(0, 1024), (4, 1024), (4, 1025), (3, 2048)])
+def test_flash_attn_kvcache_splitkv_single_tile_decode(num_splits, cache_length):
+    torch.manual_seed(0)
+    device = "cuda"
+    lengths = [1, 255, 257, cache_length]
+    pages_per_seq = (cache_length + 255) // 256
+    q = torch.randn(4, 1, 4, 64, device=device, dtype=torch.float16)
+    k = torch.randn(4 * pages_per_seq, 256, 2, 64, device=device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    pages = torch.randperm(4 * pages_per_seq, device=device, dtype=torch.int32).reshape(4, pages_per_seq)
+    out, lse = flash_attn_with_kvcache(
+        q, k, v, cache_seqlens=torch.tensor(lengths, device=device, dtype=torch.int32),
+        block_table=pages, num_splits=num_splits, return_softmax_lse=True,
+    )
+    for b, length in enumerate(lengths):
+        keys = k[pages[b].long()].reshape(-1, 2, 64)[:length].double().repeat_interleave(2, dim=1)
+        vals = v[pages[b].long()].reshape(-1, 2, 64)[:length].double().repeat_interleave(2, dim=1)
+        logits = torch.einsum("hd,khd->hk", q[b, 0].double(), keys) / 8
+        expected = torch.einsum("hk,khd->hd", logits.softmax(dim=-1), vals)
+        torch.testing.assert_close(out[b, 0], expected.to(out.dtype), rtol=2e-3, atol=1e-3)
+        torch.testing.assert_close(lse[b, :, 0], logits.logsumexp(-1).float(), rtol=2e-5, atol=2e-3)
+
+
+@pytest.mark.parametrize("num_splits", [2, 17])
+def test_flash_attn_kvcache_splitkv_preserves_split_mass(num_splits):
+    # D192 assigns one 64-key tile to each split, with a single key in the last tile.
+    seqlen_k = 64 * (num_splits - 1) + 1
+    q = torch.zeros((1, 65, 1, 192), device="cuda", dtype=torch.bfloat16)
+    k = q.new_zeros((1, seqlen_k, 1, 192))
+    v = torch.zeros_like(k)
+    q[..., 0] = 1
+    k[..., 0] = -(2**33)
+    v[:, -1] = 1
+    out = flash_attn_with_kvcache(q, k, v, causal=True, softmax_scale=1.0, num_splits=num_splits)
+    torch.testing.assert_close(out[0, 64], torch.full_like(out[0, 64], 1 / seqlen_k), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("d", [64, 128])
 def test_flash_attn_varlen_paged_kv_lse_empty_blocks(d, dtype):
